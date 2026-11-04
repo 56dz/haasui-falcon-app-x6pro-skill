@@ -1,0 +1,10 @@
+# Build and device artifacts
+build/
+dist/*.zip
+*.so
+*.elf
+*.amr
+
+# Local profiling output
+profiles/*.local.env
+.tmp/
