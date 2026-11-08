@@ -1,7 +1,7 @@
 interface:
-  display_name: "有道词典笔 X6 Pro 视频应用开发"
-  short_description: "X6 Pro (RK3562) Falcon 视频/音频应用的开发与踩坑手册"
-  default_prompt: "Use $haasui-falcon-app-x6pro to profile the target pen, build the Falcon media app, and verify playback, audio routing, and KMS plane behaviour on a real device."
+  display_name: "有道词典笔 X6 Pro 视频 / 实时流应用开发"
+  short_description: "X6 Pro (RK3562) Falcon 音视频、实时流与 native JSAPI 的开发与踩坑手册"
+  default_prompt: "Use $haasui-falcon-app-x6pro to profile the target pen, then build and verify a Falcon app: GStreamer pipeline on KMS, audio routing (speaker/Bluetooth), a hand-written ICE/DTLS-SRTP realtime path when webrtcbin is absent, native JSAPI modules, Weex UI dialect rules, and touch/text input back to a remote session."
 
 policy:
   allow_implicit_invocation: true

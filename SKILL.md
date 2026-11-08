@@ -1,14 +1,15 @@
 ---
 name: haasui-falcon-app-x6pro
-description: Build video/audio applications for NetEase Youdao Dictionary Pen X6 Pro (RK3562) on the Falcon mini-app runtime. Use when writing a Vue/QuickJS mini-app that plays network video, when a GStreamer + MPP + DRM/KMS pipeline must be driven from a native JSAPI, when audio routing (speaker / Bluetooth A2DP) or A/V sync is wrong, when the KMS video plane covers UI or survives after teardown, or when packaging and installing .amr builds on the device. Distilled from a real production video client; every rule here was paid for with a device-side experiment.
+description: Build video, audio and realtime-streaming applications for NetEase Youdao Dictionary Pen X6 Pro (RK3562) on the Falcon mini-app runtime. Use when writing a Vue/QuickJS mini-app that plays network video, when a GStreamer + MPP + DRM/KMS pipeline must be driven from a native JSAPI, when the device has no webrtcbin/libsrtp/libnice and a WebRTC-style realtime stream (cloud gaming, remote desktop) must be decoded by hand-writing ICE + DTLS-SRTP + RTP, when touch/text input must be sent back to a remote session, when audio routing (speaker / Bluetooth A2DP) or A/V sync is wrong, when the KMS video plane covers UI or survives after teardown, when the Weex/Falcon UI dialect renders differently on the device than in the build, or when packaging and installing .amr builds. Distilled from three shipped device clients; every rule here was paid for with a device-side experiment.
 ---
 
-# 有道词典笔 X6 Pro · Falcon 视频应用开发
+# 有道词典笔 X6 Pro · Falcon 音视频 / 实时流应用开发
 
-这份 skill 来自一个真实上线的词典笔视频客户端：Falcon/QuickJS 做 UI，native `.so` 驱动
-GStreamer + Rockchip MPP 硬解，画面直接走 DRM/KMS 平面。文档里每一条"必须/禁止"背后都有
-一次真机实测，出处写在括号里。**不要把这里的数值当通用常量**——先在目标固件上复现验证，
-再写进代码。
+这份 skill 来自三个真实上线的词典笔应用：本地/网络视频播放器、直播客户端，以及一个把
+第三方云游戏服务搬上笔的串流客户端（自写 ICE / DTLS-SRTP / RTP，硬解上 KMS，含触摸与
+文本输入回传）。Falcon/QuickJS 做 UI，native `.so` 驱动 GStreamer + Rockchip MPP 硬解，
+画面直接走 DRM/KMS 平面。文档里每一条"必须/禁止"背后都有一次真机实测，出处写在括号里。
+**不要把这里的数值当通用常量**——先在目标固件上复现验证，再写进代码。
 
 ## 适用与不适用
 
@@ -16,14 +17,20 @@ GStreamer + Rockchip MPP 硬解，画面直接走 DRM/KMS 平面。文档里每�
 
 - Falcon / QuickJS mini-app、Vue 2 SFC 页面，需要播放网络视频或音频。
 - 需要自己维护一条 `ffmpeg` 子进程 → GStreamer → MPP → KMS 的播放管线。
+- 需要播放**实时流**（WebRTC / RTP / 云游戏），设备上没有 `webrtcbin`/`libnice`/`libsrtp`，
+  必须自己写 ICE + DTLS-SRTP，再用 `appsrc` 喂裸 H.264。
 - 音画不同步、起播跳秒、暂停恢复卡顿、进度条回跳、画面盖住键盘。
-- 扬声器与蓝牙耳机之间切换音量、耳机无声、音量被清零。
+- 扬声器与蓝牙耳机之间切换音量、耳机无声、音量被清零、蓝牙延迟。
 - `.amr` 打包、`miniapp_cli install`、真机验证。
+- 需要 native `.so` 把新能力（裸 HTTP / WebSocket / 加密 / 媒体）导出给 JS。
+- 逆向一个第三方 Web 服务并做成客户端：接口取证、错误码、发布与隐私自检。
 
 不适用：
 
 - 只有纯 UI、不涉及媒体的 app —— 直接用平台高层 JSAPI 就够，不要上 native。
-- 把某个 app 的业务协议（登录、推荐流、弹幕）当平台能力。这些属于应用层，不是 Falcon。
+- 把某个 app 的业务协议（登录、推荐流、弹幕）当平台能力。这些属于应用层，不是 Falcon；
+  只有"怎么安全地逆向并维护这类协议"是平台无关的工程纪律，见
+  [references/service-reverse-ops.md](references/service-reverse-ops.md)。
 
 ## 先做设备画像，再写一行代码
 
@@ -144,6 +151,66 @@ ffmpeg（拉流 + 封装转换） → 单 FIFO → matroskademux → h264parse �
   无法处理巨大起始 PTS，preroll 直接卡死。直播走 `souphttpsrc ! flvdemux` 直连，
   `durationMs=0`，位置用"本次会话已播时长"而不是绝对 PTS。
 
+## 第三条路线：实时流（WebRTC 类），设备上没有 webrtcbin
+
+点播和直播之外还有一类：对端是一个实时媒体网关，要通过 ICE 打洞、DTLS 握手、SRTP 解密，
+再把裸 H.264 / Opus 交给 GStreamer。**这条路上所有现成组件都不存在** —— 实测
+`ls /usr/lib/gstreamer-1.0/` 里没有 `libgstwebrtc`、没有 `libnice`、没有 `libsrtp`；
+唯一能用的是 `libssl 1.1.1l`（导出 DTLS-SRTP 的 keying material 符号）。
+
+可用的架构只有一条：
+
+```text
+UDP socket -> STUN / DTLS / SRTP 自实现 -> RTP 拆包 -> appsrc(video/x-h264,byte-stream,au)
+                                                     -> appsrc(audio/x-opus) -> 音频链路
+```
+
+五个最贵的坑（每一条都曾导致"握手成功但没画面"）：
+
+1. **`SSL_export_keying_material` 的 label 长度**：`"EXTRACTOR-dtls_srtp"` 是 **19** 字节。
+   传 21 会把长度带进 PRF seed，导出的密钥完全不同 -> 每包 `auth_fail`。
+   最阴的是自测服务端若也写 21，**两端同错时永远测试通过**。
+2. **STUN 与 DTLS 共用同一个 UDP 5 元组**。不按首字节分流的话，STUN Binding Request
+   会被当成 DTLS 记录喂给 `SSL_read`，握手随机失败。用 `recv(MSG_PEEK)` 分类。
+3. **connected UDP socket 上的 ICMP 错误是瞬态的**。把 `ECONNREFUSED` 当致命错误会在
+   首帧之后立刻退出媒体循环 —— 表现为"出画一瞬间然后黑屏"。
+4. **`GST_STATE_NULL` 是 1，不是 0**。传 0 是非法目标态，`set_state` 静默失败，
+   退出后 KMS 平面把 UI 永久盖住。
+5. **MPP 不做 KMS 旋转**，面板是竖屏（480x960）、逻辑画布是横屏（960x266），
+   必须在解码器里转（`mppvideodec rotation=270`），且 `render-rectangle` 要用
+   **面板物理坐标**换算。
+
+完整的状态机、SDP 解析细节、487 Role Conflict、PLI 的 SSRC 规则、SPS/PPS 解析，见
+[references/webrtc-realtime.md](references/webrtc-realtime.md)。
+
+> 这一层的调试要按"阶段"隔离：先把 ICE 打通（看有没有 Binding Response），
+> 再单独验 DTLS（看 `SSL_do_handshake` 是否返回 1），再单独验 SRTP（看 `auth_fail` 是否为 0），
+> 最后才接 GStreamer。四个阶段混在一起调，任何一处错都表现为"没画面"。
+
+## UI 层：Falcon/Weex 方言与页面栈
+
+UI 层的坑不比媒体层少，而且更隐蔽 —— **大部分是"构建通过、真机走样"或"静默不生效"**：
+
+- 每个 `.vue` 必须有 `<style lang="less" scoped>` 且首行 `@import "base.less"`（无前缀）。漏了会黑屏且无报错。
+- `<style scoped>` **实际是全局合并**，跨页撞类名会互相污染 -> 每页用自己的类名前缀。
+- Weex **只支持单类名选择器**，`.a .b` / `.a.b` 一律构建失败。
+- Weex **默认 `flex-direction: column`**，不写 `row` 时 `justify-content` 管的是纵向。
+- `flex: 1` 无效，必须写 `flex-grow/shrink/basis` 三连。
+- 没有可靠的 `position: absolute` 与 `z-index`，浮层只能用 `v-if` 整块替换。
+- **把展示文案写成 method 会渲染出 `function bound xxx() { [native code] }`** —— 必须是 `data()` 里的字符串。
+- **`$falcon.navBack` 在某些固件里根本不存在**（框架 bundle 里 `grep -c navBack` = 0），
+  "返回"必须用 `closePageByName('<页名>')`；用 `navTo` 兜底会变成 push，页面栈越堆越深。
+- **页面级 `onHide`/`onUnload` 可能根本不回调**，但 **App 级 `onHide` 会**。
+  所有"切后台要做的收尾"（停管线、还平面）必须写在 `app.js`。
+
+完整清单见 [references/falcon-ui-dialect.md](references/falcon-ui-dialect.md)。
+
+**把触屏操作送到远端会话**（云游戏 / 远程桌面这类）是另一套独立规则：移动端触摸事件
+（`down/move/up/tap`）的坐标是**视频像素**，PC 鼠标事件（`mousedown/up/move`）的坐标是
+**65535 归一化百分比** —— 两者不能互换，换错就是"点了没反应"且无任何报错。此外 `pageX/pageY`
+已经是**视频子矩形内的局部坐标**，再减一次原点会整体偏移。见
+[references/live-input.md](references/live-input.md)。
+
 ## 构建、打包、安装
 
 用**项目锁定的** Node 和 `aiot-vue-cli`，不要捡 PATH 上第一个。
@@ -194,14 +261,38 @@ adb shell miniapp_cli start <appid> index     # 页面名不带 -- 前缀
 
 ## 交付前检查
 
+媒体：
+
 - [ ] 真机跑过一次**不静音**的完整播放，确认出声、音画同步、无破音。
 - [ ] 起播、暂停→恢复、拖动进度条、seek 到片尾前、切集，五个动作的帧率都是片源帧率。
 - [ ] 拔插蓝牙耳机后仍能出声，且音量等于用户设置，不是 0。
+- [ ] 蓝牙路径下 `aplay -v` 的 `buffer_size` 是你设的值，且日志里 `underrun` 计数为 0。
 - [ ] 暂停时打开输入法，视频平面不遮挡键盘。
-- [ ] 退出播放页后 `pidof ffmpeg` 为空，`/tmp` 下无残留 FIFO。
+- [ ] 退出播放页后 `pidof ffmpeg` 为空，`/tmp` 下无残留 FIFO，`pidof aplay` 为空。
+- [ ] 连按两次"退出"、切后台、直接关 app，三条路径下 KMS 视频平面都消失（`/sys/kernel/debug/dri/0/summary` 里没有视频 plane 的 `ACTIVE`）。
 - [ ] 连续两次进入/退出播放页，无 timer、订阅、线程、子进程泄漏。
+
+native 与打包：
+
 - [ ] `readelf -d` 的每个 `NEEDED` 在设备上都存在。
-- [ ] 版本号、manifest、README、Release 三处一致。
+- [ ] `nm -D --undefined-only` 的每个符号都能被宿主解析（否则整个 `.so` 加载失败且只报"未找到模块"）。
+- [ ] `import('<plugin>')` 在真机成功，且一次 `status()` 能拿到合理字段。
+- [ ] `.amr` 装完 `miniapp_cli install` 返回 `{"ret": 0}`，解包核对 manifest/脚本/资源/`.so` 相对路径。
+- [ ] 版本号在 `version.js`、`package.json`、git tag、Release 四处一致。
+
+UI 与交互：
+
+- [ ] 五个主要页面都真机截图看过，没有"文字竖排""渲染出函数源码""布局没撑满"。
+- [ ] 每个页面用自己的类名前缀，跨页无同名类。
+- [ ] 返回动画是 pop 不是 push（连拍 16 帧可验），且页面栈不会越堆越深。
+- [ ] 切后台再回来，状态正确（不假死、不重复订阅）。
+
+发布与隐私：
+
+- [ ] 源码、构建产物、`.so`、`.amr` 用 **ASCII + UTF-16LE 双编码**扫过手机号/uid/密码/token/序列号/MAC，0 命中。
+- [ ] `profiles/evidence/**` 里的每张截图**逐张看过**，含账号、手机号、游戏 UID、内网 IP 的已打码或删除。
+- [ ] git 历史（不只是工作树）同样扫过；若改过历史，确认 `refs/remotes/*` 已删、`gc --prune=now` 做过、**远端 tag 已重指**。
+- [ ] release 附件回下载并比对 sha256。
 
 ## 参考文件索引
 
@@ -209,6 +300,11 @@ adb shell miniapp_cli start <appid> index     # 页面名不带 -- 前缀
 |---|---|
 | [references/architecture.md](references/architecture.md) | 搭建项目分层、线程模型、状态机、命令队列 |
 | [references/pipeline-video.md](references/pipeline-video.md) | 写/改媒体管线、seek、起播、直播、KMS 矩形 |
-| [references/audio-route.md](references/audio-route.md) | 音量、蓝牙、扬声器、音画偏移、音频停摆 |
+| [references/webrtc-realtime.md](references/webrtc-realtime.md) | 实时流：自写 ICE / DTLS-SRTP / RTP，喂 `appsrc`，KMS 上屏 |
+| [references/audio-route.md](references/audio-route.md) | 音量、蓝牙、扬声器、音画偏移、音频停摆、`fdsink`+`aplay` 路线 |
+| [references/native-jsapi.md](references/native-jsapi.md) | 写/改 native `.so`：交叉编译、stub 链接、JSON ABI、错误码 |
+| [references/falcon-ui-dialect.md](references/falcon-ui-dialect.md) | Weex 方言、类名前缀、页面栈与返回动画、IME、渲染验收 |
+| [references/live-input.md](references/live-input.md) | 把触屏操作送进远端会话：两套坐标单位、异常静默、点击验收 |
 | [references/debugging.md](references/debugging.md) | 取证、日志、采样器、性能测量、常见误判 |
 | [references/platform-pitfalls.md](references/platform-pitfalls.md) | 屏幕保活、输入法、打包安装、系统限制 |
+| [references/service-reverse-ops.md](references/service-reverse-ops.md) | 逆向第三方服务、错误码与单位、发布流程、隐私自检 |

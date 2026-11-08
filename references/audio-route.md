@@ -398,3 +398,237 @@ if (now - g_w.bt_check_ms < period) return;
 
 另外注意 `bluealsa-aplay -L` 在这种固件上会**直接崩**（`Aborted`），不能用来枚举 PCM。
 可靠的路径是 `bluetoothctl devices` 找已连设备，再拼 `bluealsa:DEV=<MAC>,PROFILE=a2dp`。
+
+## 另一条音频路线：进程内 `alsasink` 失败时，改用 `fdsink` + 外部 `aplay`
+
+上面那一整套（路由、AVRCP、音量权威）是"进程内 `alsasink` 能正常协商"前提下的做法。
+但有一条固件上，**同一组 caps 在 shell 里用 `gst-launch-1.0` 跑完全正常，放进本进程就必然失败**：
+
+```text
+ERROR from element asink: The stream is in the wrong format
+  (gst_audio_base_sink_wait_event)
+```
+
+换成 `audioconvert ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! alsasink sync=true`
+也照旧。排查过 `alsasink` 的 `device`/`card`/`buffer-time`/`latency-time`，全部无效后，
+可用的替代方案只有一条：**让 GStreamer 只负责解码，把裸 PCM 通过管道交给外部 `aplay` 进程。**
+
+```text
+appsrc ! queue ! opusdec ! audioconvert ! audioresample
+       ! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2
+       ! fdsink name=asink fd=<pipe-write-end> sync=false
+```
+
+`fd` 是 `fdsink` 的属性名（不是 property 字符串），构造 desc 时用 `snprintf` 拼进去。
+
+### 时机：`fdsink` 的 `sync=false` 与"时钟"
+
+`fdsink` 不是 sync sink，它不参与管线时钟。这意味着：
+
+- 音画同步不再由 GStreamer 保证——这条路线只适合"音频跟随视频"或"音频独立源"的场景
+  （例如云游戏的 RTP 音频、直播的伴音），**不适合需要严格 A/V 同步的本地点播**。
+- 需要严格同步时，仍然要解决进程内 `alsasink` 协商问题（换 sink 元素、换 raw 格式、
+  查 `/etc/asound.conf` 里的 `type plug` 链路），不要用 `fdsink` 硬凑。
+
+### `aplay` 的参数（都是实测确认过的）
+
+```c
+argv[i++] = "aplay";
+argv[i++] = <蓝牙 ? "-v" : "-q">;     /* -v 会把 ALSA setup dump 写进日志 */
+if (蓝牙) { argv[i++] = "-D"; argv[i++] = b->audio_dev; }
+argv[i++] = "-t"; argv[i++] = "raw";
+argv[i++] = "-f"; argv[i++] = "S16_LE";
+argv[i++] = "-r"; argv[i++] = rate;    /* 48000 */
+argv[i++] = "-c"; argv[i++] = channels;/* 2 */
+/* 蓝牙追加 -B/-F，见下一节 */
+argv[i++] = "-";
+```
+
+- `-D` 必须放在文件参数 `-` **之前**，否则 aplay 把它当文件名。
+- 设备的 `/bin/aplay` 是 **1.2.4**，支持 `-B/--buffer-time`（**微秒**）与
+  `-F/--period-time`（**微秒**），也支持等价的 `--buffer-size` / `--period-size`（帧）。
+  传帧数给 `-B` 会被当成微秒，得到一个几乎为零的缓冲 → 立刻 underrun。
+- `-v` 只走蓝牙：扬声器路径用 `-q` 保持日志干净。需要诊断蓝牙缓冲时，
+  `-v` 打出来的 `BUFFER_BYTES` / `PERIOD_BYTES` / `buffer_size` / `period_size`
+  是**唯一能算出真实延迟的证据**（见下）。
+
+### 必须 `signal(SIGPIPE, SIG_IGN)`
+
+蓝牙 `-D` 打不开时（没连、PCM 名错、bluealsa 没起）`aplay` 会立刻退出。
+之后 `fdsink` 继续往这条已经断掉的管道写 → 默认行为是 **SIGPIPE 直接杀掉本进程**，
+整个小程序崩溃，比"没声音"严重得多。忽略之后写失败只返回 `EPIPE`，
+`fdsink` 报一个 pipeline error，会话仍可控。
+
+```c
+static int sigpipe_armed = 0;
+if (!sigpipe_armed) { signal(SIGPIPE, SIG_IGN); sigpipe_armed = 1; }
+```
+
+只需一次，但**必须在这个库被加载后的第一处 spawn 前做**，不要放在 `main`（小程序没有 main）。
+
+### 子进程收尾：不要 `waitpid`
+
+宿主进程把 `SIGCHLD` 设成了 `SIG_IGN`（见 [platform-pitfalls.md](platform-pitfalls.md)），
+`waitpid()` 直接返回 `ECHILD`。收尾只能：`close(fd)` → `SIGTERM` → 等一小会儿 → `SIGKILL`，
+**不回收**（本来就没人回收）。子进程要 `setpgid(0, 0)`，这样 `SIGTERM` 发给整组时
+不会误伤宿主。
+
+同理，`system()` 的返回值**不可信**（返回 -1 但命令照常执行）。判断成功一律看产物：
+`amixer` 就回读控件值，转码就检查输出文件。
+
+### `amixer` 枚举控件的两步解析（这条坑过两次）
+
+`amixer -c 0 cget name='Playback Path'` 的输出形如：
+
+```text
+  ; Item #0 'OFF'
+  ; Item #1 'HP'
+  ; Item #2 'SPK'
+  ; Item #10 'RING_SPK_HP'
+  : values=2            <- 这一行才指出当前选中的是 Item #2
+```
+
+**只能**先建立 `Item #n → 名字` 映射，再读 `: values=n` 取对应名字。
+两种错误读法都会静默给出错值：
+
+| 错误做法 | 实际读到 | 后果 |
+|---|---|---|
+| 取「第一个 `Item #` 行」 | 恒为 `OFF` | 回读校验恒失败，误以为 `cset` 没生效 |
+| 取「第一对单引号」 | 控件名 `Playback Path` | 比较永远不相等，反复重设 |
+
+正确实现（片段）：
+
+```c
+char items[24][32]; int nitems = 0, cur = -1;
+while (fgets(line, sizeof line, fp)) {
+    char *it = strstr(line, "Item #");
+    if (it) {
+        int idx = atoi(it + 6);
+        char *q1 = strchr(it, '\''), *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
+        if (q1 && q2 && idx >= 0 && idx < 24) {
+            size_t ln = (size_t)(q2 - q1 - 1); if (ln > 31) ln = 31;
+            memcpy(items[idx], q1 + 1, ln); items[idx][ln] = 0;
+            if (idx + 1 > nitems) nitems = idx + 1;
+        }
+        continue;
+    }
+    char *v = strstr(line, ": values=");
+    if (v) { cur = atoi(v + 9); break; }
+}
+```
+
+拿到 `cur` 之后 `items[cur]` 才是当前路径。**`cset` 之后一定要回读一次**，
+这是唯一可信的成功判据。
+
+### 蓝牙 PCM 的默认缓冲是 256 ms 的死延迟
+
+用户的原话是「用耳机时音频落后画面约 0.5 秒，扬声器没问题」。量化方法：让 `aplay` 带 `-v`
+跑一次蓝牙 PCM，看它自己打印的 setup：
+
+```text
+BUFFER_BYTES: 98284
+```
+
+`98284 / 4 字节 / 2 声道 = 12285 帧`，`12285 / 48000 Hz = 0.256 s`。
+再加上 SBC 编码与耳机侧 jitter buffer（约 0.2 s，**客户端改不了**），正好对上体感的 0.5 秒。
+
+所以蓝牙分支必须显式缩小缓冲：
+
+```c
+if (b->audio_dev[0]) {          /* 蓝牙 */
+    argv[i++] = "-B"; argv[i++] = "150000";   /* 150 ms */
+    argv[i++] = "-F"; argv[i++] = "30000";    /*  30 ms */
+}
+```
+
+- `150/30` 是「明显变快且不欠载」的折中，不要更激进：云游戏音频是实时流，
+  缓冲太小会被网络抖动打成 underrun，听感是断续/爆音，比延迟更难受。
+- 扬声器路径（rk817 + aw883xx 直连）本来没有延迟问题，**保持默认不动**。
+- 验证：真机上改完看 `aplay -v` 的 dump 是否变成 `buffer_size: 7200`（= 150 ms × 48 kHz）、
+  `period_size: 1440`、`period_time: 30000`，并确认日志里 **没有** `underrun!!!`。
+  本机实测 `grep -c underrun` = 0，且 `/proc/asound/card1/pcm0p/sub0/status`
+  变成 `closed`（扬声器 PCM 没被打开）——这两条同时成立才说明声音真的走了蓝牙。
+
+### 一条辅助判据：走没走蓝牙，看扬声器 PCM 的状态
+
+```sh
+cat /proc/asound/card1/pcm0p/sub0/status
+# closed      -> 扬声器通路没被打开，声音走蓝牙
+# RUNNING     -> 扬声器在出声（hw_ptr 应持续递增，见下）
+```
+
+`hw_ptr` 递增是"真的在放"的硬证据；`state: PREPARED` 且 `hw_ptr` 恒为 0 是
+"打开了但一个字节没写进去"，这时不要怀疑声卡，回去查 appsrc 协商（下面的 caps 陷阱）。
+
+### 最隐蔽的一条：裸 `audio/x-opus` 会协商失败，而 `push_buffer` 照样返回 OK
+
+`opusdec` 的 **sink 模板有两支**：
+
+```text
+audio/x-opus, channel-mapping-family: 0
+audio/x-opus, channel-mapping-family: [1,255], channels, stream-count, coupled-count
+```
+
+如果 `gst_app_src_set_caps()` 只给 `"audio/x-opus"`，caps 同时命中两支、
+协商不出唯一结果，appsrc 以 `GST_FLOW_NOT_NEGOTIATED` 收场，
+而 **`gst_app_src_push_buffer()` 依然返回 `GST_FLOW_OK`**。
+
+后果：日志里"首包已推送"一切正常，声卡停在 `PREPARED`、`hw_ptr=0`，
+**没有任何报错**——除非你挂了 bus 监视器。
+
+修法：把 `channel-mapping-family` 写死（依据网关 SDP 的 fmtr
+`sprop-stereo=1`，即双声道、family 0）：
+
+```c
+GstCaps *caps = gst_caps_from_string(
+    "audio/x-opus,rate=48000,channels=2,channel-mapping-family=0");
+gst_app_src_set_caps(src, caps);
+```
+
+**desc 里的 `caps=` 与 `gst_app_src_set_caps()` 不是一回事**——这是这块最反直觉的地方，
+两种写法都实测过，结局相反：
+
+| 写法 | 结果 |
+|---|---|
+| 只靠 desc 里的 `caps=audio/x-opus`（不调 `set_caps`） | 协商失败，`Internal data stream error`，声卡停在 `PREPARED`、`hw_ptr=0`；而 `push_buffer` 仍返回 OK |
+| desc 里写 `caps=audio/x-opus`，**parse 完之后**再 `set_caps("audio/x-opus,rate=48000,channels=2,channel-mapping-family=0")` | 协商成功，PCM 进 `RUNNING`、`hw_ptr` 递增、bus 零错误 |
+
+所以推荐的写法是**两步**：desc 里保留裸 caps（保证 `gst_parse_bin_from_description`
+能把管线建起来），拿到 `appsrc` 指针后立刻用 `gst_app_src_set_caps()` 钉死全部字段。
+**只钉 `rate/channels` 而不钉 `channel-mapping-family` 仍然会命中两支模板**，
+family 是唯一能把模板收敛到一支的字段（本设备网关 fmtp 是 `sprop-stereo=1`，取 family 0）。
+
+> 判断是否真的协商成功，**不要**看 `push_buffer` 的返回值（它恒为 OK），
+> 要看声卡的 `/proc/asound/card1/pcm0p/sub0/status` 是否进 `RUNNING`，
+> 或 bus 上有没有 `Internal data stream error`。
+
+### bus 监视器是必需品，不是调试工具
+
+上面每一种静默失败（协商失败、raw 格式不符、缺少 queue）都只在 bus 上出现：
+
+```c
+/* 非阻塞轮询，在媒体线程的 tick 里调用 */
+GstMessage *m = gst_bus_timed_pop_filtered(bus, 0,
+        GST_MESSAGE_ERROR | GST_MESSAGE_WARNING | GST_MESSAGE_EOS);
+if (m) { /* 取 gst_message_parse_error 的 GError->message 与 debug 串，落到自己的日志 */ }
+```
+
+设备上 `GStreamer` 默认把 `GST_DEBUG` 写 **stderr**，而小程序进程的 stderr
+**不被 `/userdata/applog` 捕获**（实测打开 `GST_DEBUG` 开关后日志里一条 `GST_` 行都没有）。
+要看到它必须自己挂 `gst_debug_add_log_function()` 转进 `console.warn` 那条通路。
+
+### 不要 `g_free`
+
+设备 `libglib` 里查不到 `g_free`，而 native `.so` 里出现**未解析符号会让整个库加载失败**
+（JS 侧只看到"未找到模块"，没有更具体的错）。所以这类地方**故意不 free**，
+宁可漏一点内存也不要让库加载不上。详见 [native-jsapi.md](native-jsapi.md)。
+
+## 音频路线选择速查
+
+| 现象 | 路线 | 关键点 |
+|---|---|---|
+| `alsasink` 协商成功，需要严格同步 | 进程内 `alsasink ! sync=true` | 音量权威源、AVRCP 双衰减见本文前半 |
+| `alsasink` 必报 `wrong format`，但 shell 里正常 | `fdsink fd=<pipe>` + 外部 `aplay` | `sync=false`，SIGPIPE，不 `waitpid` |
+| 蓝牙延迟约 0.5 s | 同上 + `-B 150000 -F 30000` | 先 `-v` 看 `BUFFER_BYTES` 再定值 |
+| 有包无声、无报错 | 查 bus + 钉死 `channel-mapping-family` | `push_buffer` 返回 OK 不代表协商成功 |
+| 起播正常，几十秒后音频停 | 看门狗（本文前面那一节） | 判据要"音频不动 **且** 视频在涨" |

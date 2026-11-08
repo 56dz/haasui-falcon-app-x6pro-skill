@@ -280,7 +280,7 @@ const rows = gridToRows(grid, size);
 这套渲染引擎对 `flex-grow/shrink/basis` 的支持不完整。需要固定高度的区域，直接写
 `height` + `flex-grow: 0` + `flex-shrink: 0`，不要依赖 flex 分配。
 
-## 触摸
+## 触摸注入与自动化
 
 ### 没有 evdev 注入
 
