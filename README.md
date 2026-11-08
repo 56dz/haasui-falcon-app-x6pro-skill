@@ -48,16 +48,31 @@
 
 ## 使用方式
 
-这是给 AI 编码助手用的 skill。把它放到你的 skills 目录：
+这是给 AI 编码助手用的 skill（也可当人读的手册，`references/` 下每份文件都能独立阅读）。
 
 ```sh
-# 典型的 DSH skill 位置
-cp -r haasui-falcon-app-x6pro ~/.dsh/skills/
+git clone https://github.com/56dz/haasui-falcon-app-x6pro-skill.git \
+  ~/.dsh/skills/haasui-falcon-app-x6pro
 ```
 
-之后当你的任务涉及"词典笔 / Falcon / 小程序视频播放"时，agent 会自动加载它。
+**注意目录名**：`SKILL.md` 的 frontmatter 是 `name: haasui-falcon-app-x6pro`，
+所以克隆下来要落到**同名目录**（如上），否则部分加载器会以目录名注册它。
 
-也可以直接当人读的手册用——`references/` 下的每份文件都能独立阅读。
+之后当任务涉及"词典笔 / Falcon / 小程序音视频 / 实时流 / Weex 界面"时，agent 会自动加载它。
+
+各文件都可以单独读，不必按顺序：
+
+| 你的处境 | 直接读 |
+|---|---|
+| 第一次接触这个机型 | [SKILL.md](SKILL.md) 的「先做设备画像」 |
+| 有画面但没声音 / 蓝牙没声 | [references/audio-route.md](references/audio-route.md) |
+| 画面出不来、位置或方向不对 | [references/pipeline-video.md](references/pipeline-video.md) |
+| 要接一路实时流（云游戏 / 远程桌面） | [references/webrtc-realtime.md](references/webrtc-realtime.md) |
+| 要写 native `.so` | [references/native-jsapi.md](references/native-jsapi.md) |
+| 界面构建过了但真机走样 | [references/falcon-ui-dialect.md](references/falcon-ui-dialect.md) |
+| 点了没反应（远端会话） | [references/live-input.md](references/live-input.md) |
+| 要逆向一个第三方服务并发布 | [references/service-reverse-ops.md](references/service-reverse-ops.md) |
+| 不知道从哪下手、怎么取证 | [references/debugging.md](references/debugging.md) |
 
 ## 关于
 
